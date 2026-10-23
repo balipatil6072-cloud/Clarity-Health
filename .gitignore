@@ -1,0 +1,10 @@
+node_modules/
+dist/
+.vscode/
+.env
+.env.*
+!.env.example
+server/uploads/*
+!server/uploads/.gitkeep
+coverage/
+npm-debug.log*
