@@ -61,7 +61,27 @@ function AuthPage({ mode, onLogin }) {
       if (patient) setForm((current) => current.email || current.password ? current : { name: '', email: patient.email, password: patient.password });
     }).catch(() => { });
   }, [register]);
-  const submit = async (e) => { e.preventDefault(); setError(''); setBusy(true); try { const { data } = await api.post(`/auth/${register ? 'register' : 'login'}`, form); let demo = false; try { demo = (await api.get('/auth/me')).data.demoMode; } catch { } onLogin(data.user, demo); navigate('/app'); } catch (err) { setError(err.message); } finally { setBusy(false); } };
+  const submit = async (e) => {
+    e.preventDefault(); setError(''); setBusy(true);
+    try {
+      let credentials = form;
+      if (!register && form.email.toLowerCase().endsWith('@clarity.demo')) {
+        try {
+          const { data: currentDemo } = await api.get('/demo/credentials');
+          const currentAccount = currentDemo.enabled && currentDemo.accounts?.find((account) => account.email === form.email.toLowerCase());
+          if (currentAccount) {
+            credentials = { email: currentAccount.email, password: currentAccount.password };
+            setForm((current) => ({ ...current, ...credentials, name: '' }));
+          }
+        } catch { }
+      }
+      const { data } = await api.post('/auth/' + (register ? 'register' : 'login'), credentials);
+      let demo = false;
+      try { demo = (await api.get('/auth/me')).data.demoMode; } catch { }
+      onLogin(data.user, demo); navigate('/app');
+    } catch (err) { setError(err.message); }
+    finally { setBusy(false); }
+  };
   return <main className="auth-page"><div className="auth-top"><Brand /><Link className="text-link" to="/">Back to overview <ArrowRight size={15} /></Link></div><div className="auth-card"><div className="auth-mark"><HeartPulse size={22} /></div><div className="eyebrow">{register ? 'START YOUR WORKSPACE' : 'WELCOME BACK'}</div><h1>{register ? 'Create your account' : 'Sign in to Clarity'}</h1><p>{register ? 'A private place to organize your health records.' : 'Continue to your patient or clinician workspace.'}</p>{error && <div className="inline-error"><AlertCircle size={17} />{error}</div>}
     <form onSubmit={submit} className="form-stack">{register && <label>Full name<input autoComplete="name" required value={form.name} onChange={(e) => setForm({ ...form, name: e.target.value })} placeholder="Your name" /></label>}<label>Email address<input autoComplete="email" type="email" required value={form.email} onChange={(e) => setForm({ ...form, email: e.target.value })} placeholder="you@example.com" /></label><label>Password<input autoComplete={register ? 'new-password' : 'current-password'} type="password" required minLength={register ? 10 : 1} value={form.password} onChange={(e) => setForm({ ...form, password: e.target.value })} placeholder={register ? 'At least 10 characters' : 'Your password'} />{register && <small>Use at least 10 characters.</small>}</label><button className="button button-primary button-full" disabled={busy}>{busy ? 'Please wait…' : register ? 'Create patient account' : 'Sign in'} <ArrowRight size={16} /></button></form>
     {!register && demoAccounts.length > 0 && <div className="demo-box"><div className="demo-title"><Sparkles size={16} /> Demo accounts <span>DEVELOPMENT</span></div><div className="demo-accounts">{demoAccounts.map((account) => <button type="button" key={account.role} onClick={() => { setForm({ name: '', email: account.email, password: account.password }); setError(''); }}><b>{roleTitle(account.role)}</b><span>{account.email}</span></button>)}</div><small>Synthetic records only. Select an account to fill its current demo credentials.</small></div>}

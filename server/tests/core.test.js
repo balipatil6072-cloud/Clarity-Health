@@ -209,6 +209,20 @@ test('register never accepts a self-selected privileged role', async () => {
   assert.equal((await response.json()).user.role, 'patient');
 });
 
+test('fresh demo credentials authenticate patient, clinician, and administrator accounts', async () => {
+  await store.seedDemo();
+  const response = await fetch(`${base}/demo/credentials`);
+  assert.equal(response.status, 200);
+  const payload = await response.json();
+  assert.equal(payload.enabled, true);
+  assert.deepEqual(payload.accounts.map((account) => account.role).sort(), ['admin', 'doctor', 'patient']);
+  demoCredentials = payload.accounts;
+  for (const account of demoCredentials) {
+    const login = await fetch(`${base}/auth/login`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ email: account.email, password: account.password }) });
+    assert.equal(login.status, 200, `fresh ${account.role} demo credentials should work`);
+  }
+});
+
 test('patient ownership checks block access to another patient and doctor records', async () => {
   const other = await store.createUser({ name: 'Other Patient', email: 'other@example.test', role: 'patient', status: 'active', passwordHash: 'not-used', doctorPatientIds: [] });
   const otherPatient = await fetch(`${base}/patients/${store.id(other)}/timeline`, { headers: { Cookie: patientCookie } });
