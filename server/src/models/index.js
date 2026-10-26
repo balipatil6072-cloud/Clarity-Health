@@ -18,6 +18,7 @@ const resultSchema = new Schema({
   status: { type: String, enum: ['within', 'low', 'high', 'unknown'], default: 'unknown' },
   confidence: Number,
   sourcePage: Number,
+  evidenceQuote: { type: String, maxlength: 700, default: '' },
 }, { _id: true });
 
 const reportSchema = new Schema({
@@ -28,8 +29,14 @@ const reportSchema = new Schema({
   reportDate: { type: Date, required: true },
   uploadStatus: { type: String, enum: ['uploaded', 'processed', 'needs-review'], default: 'uploaded' },
   processingStatus: { type: String, enum: ['complete', 'manual-entry', 'failed'], default: 'manual-entry' },
-  extractionMethod: { type: String, enum: ['pdf-text', 'manual-image'], default: 'manual-image' },
+  extractionMethod: { type: String, enum: ['pdf-text', 'ai-vision-pdf', 'ai-vision-image', 'manual-image'], default: 'manual-image' },
   extractedText: { type: String, select: false },
+  documentType: { type: String, enum: ['laboratory', 'imaging', 'clinical-note', 'other-medical', 'unknown'] },
+  documentSummary: { type: String, maxlength: 1800, default: '' },
+  documentFindings: [{ text: { type: String, maxlength: 600 }, evidenceQuote: { type: String, maxlength: 700 }, sourcePage: Number, confidence: Number }],
+  questionsForClinician: [{ type: String, maxlength: 240 }],
+  extractionProvider: { type: String, default: 'rules-demo' },
+  extractionLimitations: { type: String, maxlength: 800, default: '' },
   results: [resultSchema],
 }, { timestamps: true });
 reportSchema.index({ patientId: 1, reportDate: -1 });
@@ -37,13 +44,14 @@ reportSchema.index({ patientId: 1, reportDate: -1 });
 const findingSchema = new Schema({
   testName: String, observedValue: Schema.Types.Mixed, unit: String, referenceRange: String,
   status: String, interpretation: String, evidenceSource: String, uncertainty: String,
+  evidenceQuote: String, sourcePage: Number, confidence: Number,
   recommendedNextSteps: [String], clinicianReviewRequired: { type: Boolean, default: true },
 }, { _id: true });
 const analysisSchema = new Schema({
   patientId: { type: Schema.Types.ObjectId, ref: 'User', required: true, index: true },
   reportIds: [{ type: Schema.Types.ObjectId, ref: 'MedicalReport' }],
   version: { type: Number, default: 1 }, summary: String, findings: [findingSchema],
-  suggestedNextSteps: [String], provider: { type: String, default: 'rules-demo' }, model: String,
+  suggestedNextSteps: [String], questionsForClinician: [String], provider: { type: String, default: 'rules-demo' }, model: String,
   reviewStatus: { type: String, enum: ['needs-review', 'reviewed'], default: 'needs-review' },
   reviewNote: String, reviewedBy: { type: Schema.Types.ObjectId, ref: 'User' }, reviewedAt: Date,
 }, { timestamps: true });

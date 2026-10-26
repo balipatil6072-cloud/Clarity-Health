@@ -11,9 +11,9 @@ A college DTI project MVP for organizing synthetic patient records, extracting b
 - Development demo accounts for patient, clinician, and administrator, with synthetic reports, trends, and assigned clinician access.
 - Private PDF and image uploads with generated server filenames, size/MIME/extension and file-signature checks. Uploaded files live under `server/uploads` and are never publicly served.
 - Conservative extraction for a small list of common lab tests from text-based hospital/clinic PDFs. PDF values must remain supported by the extracted source text. Unrelated or unreadable PDFs are rejected.
-- Image uploads are stored with no OCR extraction. Patients must confirm the image is a medical report and manually transcribe supported lab results; the analysis labels those values as patient-entered and unverified.
+- Optional server-side vision reads uploaded PDFs, including scanned pages, and supported report images. It extracts candidate lab values with evidence quotes and page numbers; patients must verify them against the source. Without an API key, selectable-text PDFs use the local parser and photos require confirmed manual transcription.
 - Deterministic comparison against the reference range stated in the report. A missing range remains “Unable to determine.”
-- Optional backend-only OpenAI-compatible chat-completions analysis, with schema checks and deterministic fallback when no key is configured. AI cannot create the factual test values or source citations shown in findings.
+- Optional server-only vision extraction and report analysis. Patient report chat answers from one selected, access-checked report and shows source evidence. Without a key, the labeled fallback uses only saved data from that report and does not create sample results.
 - Patient history, date/search filters, unit-matched trend charts, source filenames, clinician review notes, follow-up tasks, account management, and audit events.
 - MongoDB persistence when configured; in-memory demo storage otherwise.
 
@@ -49,7 +49,7 @@ Open `.env` and set at least a long random `JWT_SECRET`. Keep `.env` private and
 | `COOKIE_SECURE` | Set `true` behind HTTPS in production; keep `false` for local HTTP |
 | `MONGODB_URI` | MongoDB connection. Leave empty for memory-only demo mode |
 | `DEMO_MODE` | `true` provisions synthetic demo accounts and reports; use `false` in production |
-| `OPENAI_API_KEY` | Optional backend-only provider credential; never add it to client variables |
+   | OPENAI_API_KEY | Optional server-only key. Set it to enable vision extraction for PDFs/images and LLM explanations/chat; without it, labeled deterministic/manual fallbacks are used |
 | `OPENAI_MODEL` | Provider model name (default `gpt-4o-mini`) |
 | `OPENAI_BASE_URL` | OpenAI-compatible API base URL |
 | `MAX_UPLOAD_MB` | Upload limit (default 10 MB) |
@@ -97,8 +97,8 @@ Local demo passwords are random for each server start and are shown in the sign-
 ## Demonstrate the workflow
 
 1. Sign in as the demo patient. Review the fictional January and April history, flagged values, and the trend chart.
-2. Choose **Add a report** and upload a text-based hospital/clinic PDF or a report photo. Enter its report date and category.
-3. Verify extracted values or manually add test name, result, unit, and the range printed by the report. Save and analyze.
+2. Choose **Add a report** and upload a hospital/clinic PDF or report photo. Enter its date and category. With OPENAI_API_KEY configured, the server sends the selected file to the configured provider for vision extraction.
+3. Check each extracted value and source quote against the file, correct mistakes, confirm the source, then save and analyze. Without an AI key, manually transcribe a report photo and confirm the values.
 4. Open the source-linked analysis. Findings outside the stated range are informational, not diagnoses; missing ranges remain unknown.
 5. Sign in as the demo clinician. Review the assigned patient, source evidence, and summary, then add a review note or follow-up task.
 6. Sign in as the administrator to inspect account status, application health, and non-sensitive audit actions. Admin role does not grant clinical record access.
@@ -115,9 +115,10 @@ All routes are under `/api`. Browser authentication uses the HTTP-only `clarity_
 | Analysis | `POST /reports/:id/analyze`, `GET /analyses/:id`, `POST /analyses/:id/review` |
 | Clinical | `POST /patients/:id/notes`, `POST/GET /patients/:id/follow-ups`, `PATCH /follow-ups/:id`, `GET /doctor/patients` |
 | Admin | `GET /admin/users`, `PATCH /admin/users/:id`, `GET /admin/audit-logs` |
-| Health | `GET /health` |
+| Chat | POST /chat (patient report-specific assistant) |
+| Health | GET /health |
 
-Patient-specific routes verify ownership or an explicit doctor assignment. Administrators do not inherit clinical access. Login and analysis endpoints are rate limited. The upload endpoint accepts PDF, PNG, JPEG, and WebP, up to `MAX_UPLOAD_MB`. Text PDFs must contain medical report markers. Only recognized lab-test rows are extracted; entered PDF values must match parsed source rows. Scanned PDFs without text are rejected. Images have no OCR: patients attest that an image is a medical report, manually transcribe supported tests, and confirm each value before analysis. Image content itself is not machine-verified.
+Patient-specific routes verify ownership or explicit doctor assignment. Administrators do not inherit clinical access. Login, analysis, and chat endpoints are rate limited. The upload endpoint accepts PDF, PNG, JPEG, and WebP. With OPENAI_API_KEY, the selected PDF/image is sent to the configured provider for extraction. Candidate values require source quotes and patient verification. Without a key, unrelated PDFs are rejected, selectable-text PDFs use conservative local parsing, scanned PDFs are rejected, and photos allow manual transcription only.
 
 ## Checks
 
@@ -127,7 +128,7 @@ npm run build
 npm run check
 ```
 
-Tests cover conservative medical result parsing, source matching, deterministic reference-range behavior, source-linked analysis structure, compatible-unit trends, patient-only registration, patient ownership, clinician assignment, and confirmed manual image entry. They use the in-memory demo adapter and do not require a MongoDB server.
+Tests cover conservative result parsing, evidence-checked AI extraction, selected-report chat grounding, range comparisons, source-linked analysis, compatible-unit trends, account authorization, and confirmed image entry. They use the in-memory demo adapter and do not require MongoDB.
 
 ## Deploy the complete app on Vercel
 
@@ -148,7 +149,7 @@ The repository is configured as one Vercel project: Vite serves the React client
    | `VITE_API_BASE` | `/api` |
    | `VITE_MAX_UPLOAD_MB` | `4` |
    | `VITE_EPHEMERAL_REPORT_UPLOADS` | `true` |
-   | `OPENAI_API_KEY` | Optional; omit to use deterministic demo analysis rules |
+   | OPENAI_API_KEY | Optional server-only key. Set it to enable vision extraction for PDFs/images and LLM explanations/chat; without it, labeled deterministic/manual fallbacks are used |
 
 5. Deploy and test `/api/health`, patient registration/login, and a synthetic PDF upload.
 
@@ -164,10 +165,10 @@ Vercel Functions limit request bodies to 4.5 MB, so this deployment caps each up
 
 ## Limitations and next steps
 
-- OCR for scanned PDFs/images is not implemented. Photos use patient-confirmed manual transcription, and scanned PDFs without selectable text are rejected.
+- Vision extraction requires a configured provider key and vision-capable model. Candidate OCR values can be misread; patients must verify each source quote and value. Without a key, scanned PDFs and photos do not receive OCR.
 - PDF extraction recognizes only a limited list of common lab names and same-line values. It can miss valid tests or layouts, and report-marker detection cannot authenticate the issuing hospital. Always compare the source with a clinician.
 - Test-result models currently embed results in reports rather than storing separate `TestResult` documents. This keeps the MVP small; a larger deployment should migrate to a dedicated collection and add conversion tables with validated unit mappings.
-- The optional LLM integration supports OpenAI-compatible chat-completions APIs. The project does not include an urgent-result threshold library; it does not claim to detect or exclude emergencies.
+- Vision extraction uses the OpenAI Responses API file/image input, and explanation/chat use an OpenAI-compatible chat-completions endpoint. The provider receives the selected report when enabled. The project has no clinically validated emergency threshold system and cannot rule out emergencies.
 - Session cookies use `SameSite=Lax`; cross-site production hosting needs explicit CSRF defenses and cookie configuration. Separate Vercel/API deployment needs a configurable API origin.
 - Account provisioning for doctors/admins is intentionally not public; add a verified invite or administrative setup flow before real-world use.
 - This project is not HIPAA/DPDP compliant or clinically validated and must not be used as a production medical record system without substantial security, legal, privacy, and clinical review.

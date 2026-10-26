@@ -14,6 +14,8 @@ const { z } = require('zod');
 const pdfParse = require('pdf-parse');
 const store = require('./services/store');
 const { analyzeWithProvider, buildTrends } = require('./services/analysis');
+const { extractMedicalDocument } = require('./services/documentVision');
+const { askAboutReport } = require('./services/reportChat');
 const { canonicalTestName, extractResults: extractMedicalResults, isMedicalReport, sourceSupportsResult } = require('./services/reportParser');
 const { authRequired, roleRequired, canAccessPatient } = require('./middleware/auth');
 const { notFound, errorHandler } = require('./middleware/errors');
@@ -41,6 +43,7 @@ app.use((req,res,next)=>{
 });
 const loginLimit = rateLimit({ windowMs: 15 * 60 * 1000, limit: 20, standardHeaders: true, legacyHeaders: false });
 const analysisLimit = rateLimit({ windowMs: 15 * 60 * 1000, limit: 12, standardHeaders: true, legacyHeaders: false });
+const chatLimit = rateLimit({ windowMs: 15 * 60 * 1000, limit: 30, standardHeaders: true, legacyHeaders: false });
 const upload = multer({
   storage: multer.diskStorage({ destination: uploadsDir, filename: (req,file,cb)=>cb(null, `${crypto.randomUUID()}${path.extname(file.originalname).toLowerCase()}`) }),
   limits: { fileSize: maxUploadMb * 1024 * 1024 },
@@ -67,14 +70,14 @@ async function checkedFile(req){
 }
 async function permittedReport(user,reportId){const report=await store.getReport(reportId);if(!report)throw issue('Report not found.',404);if(!(await canAccessPatient(user,report.patientId)))throw issue('You are not authorized to access this report.',403);return report;}
 function validateResults(input, report, sourceConfirmed=false){
-  const schema=z.array(z.object({testName:z.string().trim().min(1).max(100),value:z.union([z.number().finite(),z.string().trim().min(1).max(100)]),unit:z.string().max(32).optional().default(''),referenceRange:z.string().max(80).optional().default(''),confidence:z.number().min(0).max(1).optional(),sourcePage:z.number().int().positive().optional()}).strict()).max(100);
+  const schema=z.array(z.object({testName:z.string().trim().min(1).max(100),value:z.union([z.number().finite(),z.string().trim().min(1).max(100)]),unit:z.string().max(32).optional().default(''),referenceRange:z.string().max(80).optional().default(''),confidence:z.number().min(0).max(1).optional(),sourcePage:z.number().int().positive().optional(),evidenceQuote:z.string().max(700).optional().default('')}).strict()).max(100);
   const parsed=schema.safeParse(input);if(!parsed.success)throw issue('Check each result: include a test name and a number or short text value.');
   return parsed.data.map((r)=>{
     const canonical=canonicalTestName(r.testName);
     if(!canonical)throw issue(`“${r.testName}” is not a supported lab test. Use a test name shown on the report.`);
     const result={...r,testName:canonical,status:require('./services/analysis').rangeStatus(Number(r.value),r.referenceRange)};
     if(report?.extractionMethod==='pdf-text'&&!sourceSupportsResult(report.extractedText,result))throw issue(`The ${canonical} value, unit, or reference range does not match the uploaded PDF text. Check it against the report and re-upload a readable PDF if the extraction is wrong.`);
-    if(report?.extractionMethod==='manual-image'&&!sourceConfirmed)throw issue('Confirm that you checked the original hospital report image and transcribed these values before saving.');
+    if((report?.extractionMethod==='manual-image'||report?.extractionMethod?.startsWith('ai-vision'))&&!sourceConfirmed)throw issue('Check each result against the original report and confirm it before saving.');
     return result;
   });
 }
@@ -104,25 +107,63 @@ app.get('/api/patients/:id',authRequired,asyncRoute(async(req,res)=>{if(!(await 
 
 app.post('/api/reports/upload',authRequired,roleRequired('patient'),upload.single('file'),asyncRoute(async(req,res)=>{
   const bytes=await checkedFile(req);const date=new Date(req.body.reportDate||'');if(!Number.isFinite(date.getTime())||date>new Date()){await fs.promises.unlink(req.file.path).catch(()=>{});throw issue('Enter a valid report date that is not in the future.');}
-  const ext=path.extname(req.file.originalname).toLowerCase();let text='',results=[],processingStatus='manual-entry';
-  if(ext==='.pdf'){
-    try{text=(await pdfParse(bytes)).text.slice(0,100000);}
-    catch{await fs.promises.unlink(req.file.path).catch(()=>{});throw issue('We could not read this PDF. Upload a text-based hospital or clinic report, or use a report photo and transcribe its values manually.',422);}
-    if(!text.trim()){await fs.promises.unlink(req.file.path).catch(()=>{});throw issue('This PDF has no readable text (it may be scanned). Upload it as a report image and transcribe its values manually.',422);}
-    if(!isMedicalReport(text)){await fs.promises.unlink(req.file.path).catch(()=>{});throw issue('This file does not look like a hospital, clinic, or laboratory report. No report was saved. Upload a medical report with patient/report details.',422);}
-    results=extractMedicalResults(text);processingStatus=results.length?'complete':'manual-entry';
-  } else if(req.body.medicalReportConfirmed!=='true') {
+  const ext=path.extname(req.file.originalname).toLowerCase();
+  const safeOriginalName=path.posix.basename(req.file.originalname.replace(/\\/g,'/')).slice(0,180);
+  const reportType=String(req.body.reportType||'Laboratory report').slice(0,80);
+  const hasVisionProvider=Boolean(process.env.OPENAI_API_KEY);
+  let text='',results=[],documentSummary='',documentFindings=[],questionsForClinician=[],documentType='unknown',extractionLimitations='',processingStatus='manual-entry';
+  let extractionMethod='manual-image',extractionProvider='rules-demo';
+  if(ext!=='.pdf'&&req.body.medicalReportConfirmed!=='true'){
     await fs.promises.unlink(req.file.path).catch(()=>{});
     throw issue('Confirm that this image is a hospital or clinic report you are authorized to upload.');
   }
+  if(hasVisionProvider&&ext==='.pdf'){
+    try{text=(await pdfParse(bytes)).text.slice(0,100000);}catch{text='';}
+    if(text.trim()&&!isMedicalReport(text)&&!extractMedicalResults(text).length){
+      await fs.promises.unlink(req.file.path).catch(()=>{});
+      throw issue('This PDF does not contain recognizable hospital, clinic, or laboratory report text. No report was saved.',422);
+    }
+  }
+  if(hasVisionProvider){
+    let extracted;
+    try {
+      extracted=await extractMedicalDocument({bytes,mimeType:req.file.mimetype,filename:safeOriginalName,reportDate:date.toISOString().slice(0,10),reportType,apiKey:process.env.OPENAI_API_KEY,model:process.env.OPENAI_MODEL,baseUrl:process.env.OPENAI_BASE_URL});
+    } catch(error) {
+      await fs.promises.unlink(req.file.path).catch(()=>{});
+      throw error;
+    }
+    if(extracted.classification!=='medical-report'){
+      await fs.promises.unlink(req.file.path).catch(()=>{});
+      throw issue(extracted.classification==='unclear'?'The report could not be identified clearly. Try a sharper, complete hospital or clinic report image. No report was saved.':'This file does not appear to be a hospital, clinic, or laboratory report. No report was saved.',422);
+    }
+    results=extracted.results.map((result)=>({...result,status:require('./services/analysis').rangeStatus(Number(result.value),result.referenceRange)}));
+    documentSummary=extracted.summary;
+    documentFindings=extracted.observations;
+    questionsForClinician=extracted.questionsForClinician;
+    documentType=extracted.documentType;
+    extractionLimitations=extracted.limitations;
+    extractionMethod=ext==='.pdf'?'ai-vision-pdf':'ai-vision-image';
+    extractionProvider='openai-responses-vision';
+  } else if(ext==='.pdf'){
+    try{text=(await pdfParse(bytes)).text.slice(0,100000);}
+    catch{await fs.promises.unlink(req.file.path).catch(()=>{});throw issue('We could not read this PDF. Configure OPENAI_API_KEY to read scanned PDFs, or upload a text-based medical report.',422);}
+    if(!text.trim()){
+      await fs.promises.unlink(req.file.path).catch(()=>{});
+      throw issue('This PDF has no selectable text. Add OPENAI_API_KEY on the server to read scanned PDFs, or upload a clear report photo after enabling AI vision.');
+    }
+    if(!isMedicalReport(text)){await fs.promises.unlink(req.file.path).catch(()=>{});throw issue('This file does not look like a hospital, clinic, or laboratory report. No report was saved. Upload a medical report with patient/report details.',422);}
+    results=extractMedicalResults(text).map((result)=>({testName:result.testName,value:result.value,unit:result.unit,referenceRange:result.referenceRange,status:require('./services/analysis').rangeStatus(Number(result.value),result.referenceRange),confidence:result.confidence,evidenceQuote:result.sourceExcerpt}));
+    extractionMethod='pdf-text';documentType='laboratory';
+    processingStatus=results.length?'complete':'manual-entry';
+  }
+  const hasExtractedContent=results.length||documentSummary||documentFindings.length;
+  processingStatus=hasExtractedContent?'complete':'manual-entry';
   if(process.env.VERCEL) await fs.promises.unlink(req.file.path).catch(()=>{});
-  const safeOriginalName=path.posix.basename(req.file.originalname.replace(/\\/g,'/')).slice(0,180);
-  const extractionMethod=ext==='.pdf'?'pdf-text':'manual-image';
-  const extractionEvidence=results.map((result)=>result.sourceExcerpt).filter(Boolean).join('\n');
-  const storedResults=results.map(({sourceExcerpt,...result})=>result);
-  const report=await store.createReport({patientId:req.user.id,originalFilename:safeOriginalName,storageKey:process.env.VERCEL?undefined:path.basename(req.file.path),reportType:String(req.body.reportType||'Laboratory report').slice(0,80),reportDate:date,uploadStatus:results.length?'processed':'needs-review',processingStatus,extractionMethod,extractedText:extractionEvidence,results:storedResults});
+  const storedResults=results;
+  const extractionEvidence=[...results.map((result)=>result.evidenceQuote),...documentFindings.map((item)=>item.evidenceQuote)].filter(Boolean).join('\n');
+  const report=await store.createReport({patientId:req.user.id,originalFilename:safeOriginalName,storageKey:process.env.VERCEL?undefined:path.basename(req.file.path),reportType,reportDate:date,uploadStatus:hasExtractedContent?'processed':'needs-review',processingStatus,extractionMethod,extractionProvider,documentType,documentSummary,documentFindings,questionsForClinician,extractionLimitations,extractedText:extractionEvidence,results:storedResults});
   await store.audit(req.user.id,'report.upload','MedicalReport',id(report),{fileType:ext,resultCount:results.length});
-  const message=ext==='.pdf'?(results.length?'Hospital report recognized. Extracted supported test rows from its text; verify them against the source before analysis.':'Hospital report recognized, but it contains no supported lab rows. No results were invented; this PDF cannot be analyzed until a supported result is present in its text.'):'Image saved as a hospital-report photo. OCR is not available, so no values were extracted; manually transcribe supported lab tests from the image and confirm each one before analysis.';
+  const message=hasVisionProvider?`Medical ${documentType==='unknown'?'report':documentType.replaceAll('-',' ')} received. AI vision extracted only source-supported text and values; check each quote and result against the original before continuing.`:ext==='.pdf'?(results.length?'Medical report recognized. Supported test rows were extracted from its selectable text; verify them against the source before analysis.':'Medical report recognized, but it contains no supported lab rows. No results were invented; add supported result rows from the source before analysis.'):'Image saved as a medical report photo. OCR needs OPENAI_API_KEY; no values were invented. You can manually transcribe supported lab tests and confirm them against the source.';
   res.status(201).json({report:{...report,extractedText:undefined},message});
 }));
 app.get('/api/reports',authRequired,asyncRoute(async(req,res)=>{
@@ -132,9 +173,18 @@ app.get('/api/reports',authRequired,asyncRoute(async(req,res)=>{
 app.get('/api/reports/:id',authRequired,asyncRoute(async(req,res)=>{const report=await permittedReport(req.user,req.params.id);res.json({report});}));
 app.delete('/api/reports/:id',authRequired,roleRequired('patient'),asyncRoute(async(req,res)=>{const report=await permittedReport(req.user,req.params.id);if(String(report.patientId)!==String(req.user.id))throw issue('You are not authorized to delete this report.',403);await store.deleteReport(req.params.id);if(report.storageKey)await fs.promises.unlink(path.join(uploadsDir,path.basename(report.storageKey))).catch(()=>{});await store.audit(req.user.id,'report.delete','MedicalReport',req.params.id);res.json({ok:true});}));
 app.post('/api/reports/:id/extract',authRequired,asyncRoute(async(req,res)=>{const report=await permittedReport(req.user,req.params.id);res.json({results:report.results||[],processingStatus:report.processingStatus||'manual-entry'});}));
-app.patch('/api/reports/:id/results',authRequired,asyncRoute(async(req,res)=>{const report=await permittedReport(req.user,req.params.id);if(req.user.role!=='patient')throw issue('Only the patient can correct extracted results.',403);const results=validateResults(req.body.results,report,req.body.sourceConfirmed===true);report.results=results;report.uploadStatus='processed';report.processingStatus=results.length?'complete':'manual-entry';await store.saveReport(report);await store.audit(req.user.id,'report.results.correct','MedicalReport',req.params.id,{resultCount:results.length});res.json({report});}));
+app.patch('/api/reports/:id/results',authRequired,asyncRoute(async(req,res)=>{const report=await permittedReport(req.user,req.params.id);if(req.user.role!=='patient')throw issue('Only the patient can correct extracted results.',403);const results=validateResults(req.body.results,report,req.body.sourceConfirmed===true);report.results=results;report.uploadStatus=results.length||report.documentSummary?'processed':'needs-review';report.processingStatus=results.length||report.documentSummary||report.documentFindings?.length?'complete':'manual-entry';await store.saveReport(report);await store.audit(req.user.id,'report.results.correct','MedicalReport',req.params.id,{resultCount:results.length});res.json({report});}));
 
-app.post('/api/reports/:id/analyze',authRequired,analysisLimit,asyncRoute(async(req,res)=>{const report=await permittedReport(req.user,req.params.id);if(!(report.results||[]).length)throw issue('Add at least one extracted or manually entered test result before analysis.');const output=await analyzeWithProvider(report,process.env.OPENAI_API_KEY,process.env.OPENAI_MODEL,process.env.OPENAI_BASE_URL);const analysis=await store.createAnalysis({...output,patientId:String(report.patientId),reportIds:[id(report)],reviewStatus:'needs-review'});await store.audit(req.user.id,'analysis.create','Analysis',id(analysis),{provider:analysis.provider});res.status(201).json({analysis});}));
+app.post('/api/chat',authRequired,roleRequired('patient'),chatLimit,asyncRoute(async(req,res)=>{
+  const parsed=z.object({reportId:z.string().min(1).max(100),message:z.string().trim().min(1).max(1200),history:z.array(z.object({role:z.enum(['user','assistant']),content:z.string().max(1000)}).strict()).max(8).optional().default([])}).strict().safeParse(req.body);
+  if(!parsed.success)throw issue('Choose a report and enter a question of up to 1,200 characters.');
+  const report=await permittedReport(req.user,parsed.data.reportId);
+  const answer=await askAboutReport({report,message:parsed.data.message,history:parsed.data.history,apiKey:process.env.OPENAI_API_KEY,model:process.env.OPENAI_MODEL,baseUrl:process.env.OPENAI_BASE_URL});
+  await store.audit(req.user.id,'report-chat.ask','MedicalReport',id(report),{provider:answer.provider});
+  res.json(answer);
+}));
+
+app.post('/api/reports/:id/analyze',authRequired,analysisLimit,asyncRoute(async(req,res)=>{const report=await permittedReport(req.user,req.params.id);if(!(report.results||[]).length&&!report.documentSummary&&!(report.documentFindings||[]).length)throw issue('No source-backed findings are available yet. Add or correct report values first.');const output=await analyzeWithProvider(report,process.env.OPENAI_API_KEY,process.env.OPENAI_MODEL,process.env.OPENAI_BASE_URL);const analysis=await store.createAnalysis({...output,patientId:String(report.patientId),reportIds:[id(report)],reviewStatus:'needs-review'});await store.audit(req.user.id,'analysis.create','Analysis',id(analysis),{provider:analysis.provider});res.status(201).json({analysis});}));
 app.get('/api/analyses/:id',authRequired,asyncRoute(async(req,res)=>{const analysis=await store.getAnalysis(req.params.id);if(!analysis)throw issue('Analysis not found.',404);if(!(await canAccessPatient(req.user,analysis.patientId)))throw issue('You are not authorized to access this analysis.',403);res.json({analysis});}));
 app.get('/api/patients/:id/analyses',authRequired,asyncRoute(async(req,res)=>{if(!(await canAccessPatient(req.user,req.params.id)))throw issue('You are not authorized to access these analyses.',403);res.json({analyses:await store.listAnalyses(req.params.id)});}));
 app.post('/api/analyses/:id/review',authRequired,roleRequired('doctor'),asyncRoute(async(req,res)=>{const a=await store.getAnalysis(req.params.id);if(!a)throw issue('Analysis not found.',404);if(!(await canAccessPatient(req.user,a.patientId)))throw issue('You are not assigned to this patient.',403);const parsed=z.object({reviewNote:z.string().trim().max(1500).optional().default(''),status:z.enum(['reviewed','needs-review']).default('reviewed')}).safeParse(req.body);if(!parsed.success)throw issue('Invalid review details.');a.reviewNote=parsed.data.reviewNote;a.reviewStatus=parsed.data.status;a.reviewedBy=req.user.id;a.reviewedAt=new Date();await store.saveAnalysis(a);await store.audit(req.user.id,'analysis.review','Analysis',req.params.id,{status:a.reviewStatus});res.json({analysis:a});}));
