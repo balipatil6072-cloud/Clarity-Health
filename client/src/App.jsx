@@ -79,7 +79,7 @@ function AuthPage({ mode, onLogin }) {
       let demo = false;
       try { demo = (await api.get('/auth/me')).data.demoMode; } catch { }
       onLogin(data.user, demo); navigate('/app');
-    } catch (err) { setError(err.message); }
+    } catch (err) { setError(typeof err?.message === 'string' && err.message !== '[object Object]' ? err.message : (typeof err === 'string' ? err : 'Authentication failed. Please check your connection and configuration.')); }
     finally { setBusy(false); }
   };
   return <main className="auth-page"><div className="auth-top"><Brand /><Link className="text-link" to="/">Back to overview <ArrowRight size={15} /></Link></div><div className="auth-card"><div className="auth-mark"><HeartPulse size={22} /></div><div className="eyebrow">{register ? 'START YOUR WORKSPACE' : 'WELCOME BACK'}</div><h1>{register ? 'Create your account' : 'Sign in to Clarity'}</h1><p>{register ? 'A private place to organize your health records.' : 'Continue to your patient or clinician workspace.'}</p>{error && <div className="inline-error"><AlertCircle size={17} />{error}</div>}

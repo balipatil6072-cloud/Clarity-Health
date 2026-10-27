@@ -58,7 +58,7 @@ const id = store.id;
 const safeUser = (u) => ({ id:id(u), name:u.name, email:u.email, role:u.role, status:u.status, createdAt:u.createdAt });
 const issue = (message,status=400) => Object.assign(new Error(message),{status});
 const asyncRoute = (fn) => (req,res,next)=>Promise.resolve(fn(req,res,next)).catch(next);
-const sessionCookieOptions = () => ({ httpOnly:true, sameSite:'lax', secure:process.env.COOKIE_SECURE==='true', maxAge: 7*24*60*60*1000, path:'/' });
+const sessionCookieOptions = () => ({ httpOnly:true, sameSite:'lax', secure:process.env.COOKIE_SECURE==='true'||Boolean(process.env.VERCEL), maxAge: 7*24*60*60*1000, path:'/' });
 function issueToken(user){return jwt.sign({sub:id(user),role:user.role},process.env.JWT_SECRET||'development-only-secret-change-me',{expiresIn:'7d'});}
 
 async function checkedFile(req){
